@@ -17,7 +17,7 @@ import (
 )
 
 // Your MongoDB Atlas Connection String
-const uri = "mongodb+srv://cloudstructuremongo:3zEfmkmoVq92FLdE@cluster0.ekrb5.mongodb.net/?retryWrites=true&w=majority"
+const uri = "mongodb://127.0.0.1/?retryWrites=true&w=majority"
 
 // A global variable that will hold a reference to the MongoDB client
 var mongoClient *mongo.Client
@@ -36,7 +36,7 @@ func main() {
 		})
 	})
 	r.GET("/jobs/:id", getJobByID)
-	r.GET("/jobs/skills", getAllParsedJobSkills)
+	r.GET("/jobs/skills", getAllSkills)
 	r.Run()
 }
 
@@ -65,7 +65,7 @@ func getJobByID(c *gin.Context) {
 	}
 	// Find job by ObjectId
 	var job bson.M
-	err = mongoClient.Database("linkedin").Collection("jobs").FindOne(context.TODO(), bson.D{{"_id", id}}).Decode(&job)
+	err = mongoClient.Database("dataStructure").Collection("jobs").FindOne(context.TODO(), bson.D{{"_id", id}}).Decode(&job)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -80,6 +80,69 @@ func getJobByID(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"job_skill": jobSkill})
 }
 
+func getSkills(c *gin.Context, from int, to int) []string {
+	var rslt = []string{}
+
+	var err error
+	var cursor *mongo.Cursor
+	// Define a cursor to iterate over the collection
+	fmt.Printf("From: %v, To: %v\n", from, to)
+	cursor, err = mongoClient.Database("dataStructure").Collection("jobs").Find(
+		context.TODO(),
+		bson.D{},
+		options.Find().SetLimit(int64(from+to)).SetSkip(int64(from)).SetProjection(bson.D{{Key: "job_skills", Value: 1}}),
+	)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return rslt
+	}
+	defer cursor.Close(context.TODO())
+
+	// get all skills
+
+	var jobs []bson.M
+	if err := cursor.All(context.TODO(), &jobs); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return rslt
+	}
+
+	for _, job := range jobs {
+		if skillsStr, ok := job["job_skills"].(string); ok {
+			skills := strings.Split(skillsStr, ", ")
+			rslt = append(rslt, skills...)
+		}
+	}
+
+	return rslt
+}
+
+func getAllSkills(c *gin.Context) {
+	skillSet := make(map[string]bool)
+	var currentSkills = []string{}
+
+	for i := 0; i < 1; i++ {
+		from := i * 1600000
+		to := (i + 1) * 160000
+		currentSkills = getSkills(c, from, to)
+
+		for _, skill := range currentSkills {
+			if !skillSet[skill] {
+				skillSet[skill] = true
+			}
+		}
+	}
+
+	var jobSkills []string = make([]string, 0, len(skillSet))
+	for i := range skillSet {
+		jobSkills = append(jobSkills, i)
+	}
+
+	// Return parsed skills
+	c.JSON(http.StatusOK, gin.H{"job_skills": jobSkills})
+
+}
+
 func getAllParsedJobSkills(c *gin.Context) {
 	fmt.Printf("Yeah")
 	//get exact microsecond for performance measurement (measured in nanoseconds)
@@ -89,12 +152,12 @@ func getAllParsedJobSkills(c *gin.Context) {
 	var err error
 	var cursor *mongo.Cursor
 	// Define a cursor to iterate over the collection
-	cursor, err = mongoClient.Database("linkedin").Collection("jobs").Find(
+	cursor, err = mongoClient.Database("dataStructure").Collection("jobs").Find(
 		context.TODO(),
 		bson.D{},
-		options.Find().SetLimit(40000).SetProjection(bson.D{{"job_skills", 1}}),
+		options.Find().SetLimit(40000).SetSkip(1000).SetProjection(bson.D{{Key: "job_skills", Value: 1}}),
 	)
-	
+
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -110,7 +173,6 @@ func getAllParsedJobSkills(c *gin.Context) {
 	var skills = []string{}
 	var skill string
 
-	fmt.Printf("Time taken for request in microseconds: %v\n", time.Since(start).Microseconds())
 	start = time.Now()
 
 	// Iterate through the cursor
@@ -129,6 +191,7 @@ func getAllParsedJobSkills(c *gin.Context) {
 			}
 		}
 	}
+	defer cursor.Close(context.TODO())
 	fmt.Printf("Time taken for processing in microseconds: %v\n", time.Since(start).Microseconds())
 	start = time.Now()
 	//convert map to array
