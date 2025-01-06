@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"net/http"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"fmt"
 
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -21,11 +23,16 @@ const uri = "mongodb://127.0.0.1/?retryWrites=true&w=majority"
 
 // A global variable that will hold a reference to the MongoDB client
 var mongoClient *mongo.Client
+var redisClient *redis.Client
 
 // The init function will run before our main function to establish a connection to MongoDB. If it cannot connect it will fail and the program will exit.
 func init() {
 	if err := connect_to_mongodb(); err != nil {
 		log.Fatal("Could not connect to MongoDB")
+	}
+
+	if err := connect_to_redis(); err != nil {
+		log.Fatal("Could not connect to Redis")
 	}
 }
 func main() {
@@ -37,6 +44,7 @@ func main() {
 	})
 	r.GET("/jobs/:id", getJobByID)
 	r.GET("/jobs/skills", getAllSkills)
+	r.GET("/jobs/countries", getAllCountries)
 	r.Run()
 }
 
@@ -51,6 +59,17 @@ func connect_to_mongodb() error {
 	}
 	err = client.Ping(context.TODO(), nil)
 	mongoClient = client
+	return err
+}
+
+func connect_to_redis() error {
+	redisClient = redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "",
+		DB:       0,
+		Protocol: 2,
+	})
+	_, err := redisClient.Ping(context.Background()).Result()
 	return err
 }
 
@@ -80,89 +99,99 @@ func getJobByID(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"job_skill": jobSkill})
 }
 
-func getSkills(c *gin.Context, from int, to int) []string {
-	var rslt = []string{}
-
-	var err error
-	var cursor *mongo.Cursor
-	// Define a cursor to iterate over the collection
-	fmt.Printf("From: %v, To: %v\n", from, to)
-	cursor, err = mongoClient.Database("dataStructure").Collection("jobs").Find(
+func getAllCountries(c *gin.Context) {
+	cursor, err := mongoClient.Database("dataStructure").Collection("jobs").Find(
 		context.TODO(),
 		bson.D{},
-		options.Find().SetLimit(int64(from+to)).SetSkip(int64(from)).SetProjection(bson.D{{Key: "job_skills", Value: 1}}),
+		options.Find().SetProjection(bson.D{{Key: "search_country", Value: 1}}),
 	)
 
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return rslt
 	}
 	defer cursor.Close(context.TODO())
 
-	// get all skills
-
-	var jobs []bson.M
-	if err := cursor.All(context.TODO(), &jobs); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return rslt
-	}
-
-	for _, job := range jobs {
-		if skillsStr, ok := job["job_skills"].(string); ok {
-			skills := strings.Split(skillsStr, ", ")
-			rslt = append(rslt, skills...)
-		}
-	}
-
-	return rslt
+	getAllUnique(c, cursor, "search_country")
 }
 
 func getAllSkills(c *gin.Context) {
-	skillSet := make(map[string]bool)
-	var currentSkills = []string{}
-
-	for i := 0; i < 1; i++ {
-		from := i * 1600000
-		to := (i + 1) * 160000
-		currentSkills = getSkills(c, from, to)
-
-		for _, skill := range currentSkills {
-			if !skillSet[skill] {
-				skillSet[skill] = true
-			}
-		}
-	}
-
-	var jobSkills []string = make([]string, 0, len(skillSet))
-	for i := range skillSet {
-		jobSkills = append(jobSkills, i)
-	}
-
-	// Return parsed skills
-	c.JSON(http.StatusOK, gin.H{"job_skills": jobSkills})
-
-}
-
-func getAllParsedJobSkills(c *gin.Context) {
-	fmt.Printf("Yeah")
-	//get exact microsecond for performance measurement (measured in nanoseconds)
-
-	start := time.Now()
-
-	var err error
-	var cursor *mongo.Cursor
-	// Define a cursor to iterate over the collection
-	cursor, err = mongoClient.Database("dataStructure").Collection("jobs").Find(
+	cursor, err := mongoClient.Database("dataStructure").Collection("jobs").Find(
 		context.TODO(),
 		bson.D{},
-		options.Find().SetLimit(40000).SetSkip(1000).SetProjection(bson.D{{Key: "job_skills", Value: 1}}),
+		options.Find().SetProjection(bson.D{{Key: "job_skills", Value: 1}}),
 	)
 
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
 	}
 	defer cursor.Close(context.TODO())
+
+	getAllUnique(c, cursor, "job_skills")
+}
+
+func getAllUnique(c *gin.Context, cursor *mongo.Cursor, key string) {
+
+	//check if the data is already in redis
+	jobSkills := getFromRedis(c, key)
+
+	fmt.Printf("1")
+	if len(jobSkills) == 0 {
+		//get it from mongo
+		jobSkills = getFromMongo(c, cursor, key)
+
+		fmt.Printf("2")
+
+		//store it in redis
+		jobSkillsJSON, err := json.Marshal(jobSkills)
+
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+
+		// set key "jobSkills" with value jobSkillsJSON
+		status, err := redisClient.Set(context.Background(), key, jobSkillsJSON, 24*time.Second).Result()
+
+		fmt.Printf("Status: %v\n", status)
+
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+
+	}
+
+	c.JSON(http.StatusOK, gin.H{"job_skills": jobSkills})
+}
+
+func getFromRedis(c *gin.Context, key string) []string {
+	start := time.Now()
+
+	// get value from key "jobSkills"
+	jobSkills, err := redisClient.Get(context.Background(), key).Result()
+
+	if err != nil {
+		return nil
+	}
+
+	// convert to array (from json string)
+	var jobSkillsArray []string
+	err = json.Unmarshal([]byte(jobSkills), &jobSkillsArray)
+
+	if err != nil {
+		return nil
+	}
+
+	fmt.Printf("Refis time taken for processing in microseconds: %v\n", time.Since(start).Microseconds())
+
+	return jobSkillsArray
+}
+
+func getFromMongo(c *gin.Context, cursor *mongo.Cursor, key string) []string {
+	//get exact microsecond for performance measurement (measured in nanoseconds)
+
+	start := time.Now()
+	// Define a cursor to iterate over the collection
 
 	// Map to store unique skills
 	skillSet := make(map[string]bool)
@@ -179,7 +208,7 @@ func getAllParsedJobSkills(c *gin.Context) {
 	for cursor.Next(context.TODO()) {
 		cursor.Decode(&job)
 		// Extract job_skill field
-		if skillsStr, ok = job["job_skills"].(string); ok {
+		if skillsStr, ok = job[key].(string); ok {
 			// Split the string into individual skills
 			skills = strings.Split(skillsStr, ", ")
 			for _, skill = range skills {
@@ -202,12 +231,6 @@ func getAllParsedJobSkills(c *gin.Context) {
 
 	fmt.Printf("Time taken for converting in microseconds: %v\n", time.Since(start).Microseconds())
 
-	// Check if we got any skills
-	if len(jobSkills) == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"message": "No job skills found"})
-		return
-	}
-
 	// Return parsed skills
-	c.JSON(http.StatusOK, gin.H{"job_skills": jobSkills})
+	return jobSkills
 }
